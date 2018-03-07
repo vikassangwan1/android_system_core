@@ -29,7 +29,7 @@ PIXELFLINGER_SRC_FILES += \
 
 endif
 
-PIXELFLINGER_CFLAGS := -fstrict-aliasing -fomit-frame-pointer
+PIXELFLINGER_CFLAGS := -O3 -fstrict-aliasing -fomit-frame-pointer
 
 PIXELFLINGER_SRC_FILES_arm := \
 	codeflinger/ARMAssembler.cpp \
