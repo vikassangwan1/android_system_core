@@ -40,6 +40,8 @@
 
 #define POWER_SUPPLY_SUBSYSTEM "power_supply"
 #define POWER_SUPPLY_SYSFS_PATH "/sys/class/" POWER_SUPPLY_SUBSYSTEM
+#define SYSFS_BATTERY_CURRENT "/sys/class/power_supply/battery/current_now"
+#define SYSFS_BATTERY_VOLTAGE "/sys/class/power_supply/battery/voltage_now"
 #define FAKE_BATTERY_CAPACITY 42
 #define FAKE_BATTERY_TEMPERATURE 424
 #define ALWAYS_PLUGGED_CAPACITY 100
@@ -153,11 +155,11 @@ BatteryMonitor::PowerSupplyType BatteryMonitor::readPowerSupplyType(const String
             { "USB_HVDCP_3", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_CDP", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_ACA", ANDROID_POWER_SUPPLY_TYPE_AC },
-            { "DASH", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_C", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_PD", ANDROID_POWER_SUPPLY_TYPE_AC },
             { "USB_PD_DRP", ANDROID_POWER_SUPPLY_TYPE_USB },
             { "Wireless", ANDROID_POWER_SUPPLY_TYPE_WIRELESS },
+            { "DASH", ANDROID_POWER_SUPPLY_TYPE_AC },
             { NULL, 0 },
     };
 
@@ -165,10 +167,8 @@ BatteryMonitor::PowerSupplyType BatteryMonitor::readPowerSupplyType(const String
         return ANDROID_POWER_SUPPLY_TYPE_UNKNOWN;
 
     ret = (BatteryMonitor::PowerSupplyType)mapSysfsString(buf.c_str(), supplyTypeMap);
-    if (ret < 0) {
-        KLOG_WARNING(LOG_TAG, "Unknown power supply type '%s'\n", buf.c_str());
+    if (ret < 0)
         ret = ANDROID_POWER_SUPPLY_TYPE_UNKNOWN;
-    }
 
     return ret;
 }
@@ -248,59 +248,75 @@ bool BatteryMonitor::update(void) {
     unsigned int i;
     double MaxPower = 0;
 
-    for (i = 0; i < mChargerNames.size(); i++) {
-        String8 path;
-        path.appendFormat("%s/%s/online", POWER_SUPPLY_SYSFS_PATH,
-                          mChargerNames[i].string());
-        if (getIntField(path)) {
+    // reinitialize the mChargerNames vector everytime there is an update
+    String8 path;
+    DIR* dir = opendir(POWER_SUPPLY_SYSFS_PATH);
+    if (dir == NULL) {
+        KLOG_ERROR(LOG_TAG, "Could not open %s\n", POWER_SUPPLY_SYSFS_PATH);
+    } else {
+        struct dirent* entry;
+        // reconstruct the charger strings
+        mChargerNames.clear();
+        while ((entry = readdir(dir))) {
+            const char* name = entry->d_name;
+            if (!strcmp(name, ".") || !strcmp(name, ".."))
+                continue;
+            // Look for "type" file in each subdirectory
             path.clear();
-            path.appendFormat("%s/%s/type", POWER_SUPPLY_SYSFS_PATH,
-                              mChargerNames[i].string());
+            path.appendFormat("%s/%s/type", POWER_SUPPLY_SYSFS_PATH, name);
             switch(readPowerSupplyType(path)) {
             case ANDROID_POWER_SUPPLY_TYPE_AC:
-                props.chargerAcOnline = true;
-                break;
             case ANDROID_POWER_SUPPLY_TYPE_USB:
-                props.chargerUsbOnline = true;
-                break;
             case ANDROID_POWER_SUPPLY_TYPE_WIRELESS:
-                props.chargerWirelessOnline = true;
+                // Check if any of them is online
+                path.clear();
+                path.appendFormat("%s/%s/online", POWER_SUPPLY_SYSFS_PATH, name);
+                if (access(path.string(), R_OK) == 0) {
+                    mChargerNames.add(String8(name));
+                    if (getIntField(path)) {
+                        path.clear();
+                        path.appendFormat("%s/%s/type", POWER_SUPPLY_SYSFS_PATH,
+                                          name);
+                        switch(readPowerSupplyType(path)) {
+                        case ANDROID_POWER_SUPPLY_TYPE_AC:
+                            props.chargerAcOnline = true;
+                            break;
+                        case ANDROID_POWER_SUPPLY_TYPE_USB:
+                            props.chargerUsbOnline = true;
+                            break;
+                        case ANDROID_POWER_SUPPLY_TYPE_WIRELESS:
+                            props.chargerWirelessOnline = true;
+                            break;
+                        default:
+                            KLOG_WARNING(LOG_TAG, "%s: Unknown power supply type\n",
+                                     mChargerNames[i].string());
+                        }
+
+                        int ChargingCurrent =
+                              (access(SYSFS_BATTERY_CURRENT, R_OK) == 0) ? abs(getIntField(String8(SYSFS_BATTERY_CURRENT))) : 0;
+
+                        int ChargingVoltage =
+                              (access(SYSFS_BATTERY_VOLTAGE, R_OK) == 0) ? getIntField(String8(SYSFS_BATTERY_VOLTAGE)) :
+                              DEFAULT_VBUS_VOLTAGE;
+
+                        double power = ((double)ChargingCurrent / MILLION) *
+                                   ((double)ChargingVoltage / MILLION);
+                        if (MaxPower < power) {
+                            props.maxChargingCurrent = ChargingCurrent;
+                            props.maxChargingVoltage = ChargingVoltage;
+                            MaxPower = power;
+                        }
+                    }
+                }
+                break;
+            case ANDROID_POWER_SUPPLY_TYPE_BATTERY:
                 break;
             default:
-                KLOG_WARNING(LOG_TAG, "%s: Unknown power supply type\n",
-                             mChargerNames[i].string());
-            }
-            path.clear();
-            path.appendFormat("%s/%s/current_max", POWER_SUPPLY_SYSFS_PATH,
-                              mChargerNames[i].string());
-            int ChargingCurrent =
-                    (access(path.string(), R_OK) == 0) ? getIntField(path) : 0;
-
-#ifdef HEALTHD_ENABLE_OP_FASTCHG_CHECK
-            if (ChargingCurrent == 0) {
-                ChargingCurrent = getOpFastCurrent(ChargingCurrent);
-            }
-#endif
-            path.clear();
-            path.appendFormat("%s/%s/voltage_max", POWER_SUPPLY_SYSFS_PATH,
-                              mChargerNames[i].string());
-
-            int ChargingVoltage =
-                (access(path.string(), R_OK) == 0) ? getIntField(path) :
-                DEFAULT_VBUS_VOLTAGE;
-            // there are devices that have the file but with a value of 0
-            if (ChargingVoltage == 0) {
-                ChargingVoltage = DEFAULT_VBUS_VOLTAGE;
-            }
-            double power = ((double)ChargingCurrent / MILLION) *
-                           ((double)ChargingVoltage / MILLION);
-            if (MaxPower < power) {
-                props.maxChargingCurrent = ChargingCurrent;
-                props.maxChargingVoltage = ChargingVoltage;
-                MaxPower = power;
-            }
-        }
-    }
+                break;
+            } //switch
+        } //while
+        closedir(dir);
+    }//else
 
     logthis = !healthd_board_battery_update(&props);
 
@@ -670,30 +686,5 @@ void BatteryMonitor::init(struct healthd_config *hc) {
         mBatteryFixedTemperature = FAKE_BATTERY_TEMPERATURE;
     }
 }
-
-#ifdef HEALTHD_ENABLE_OP_FASTCHG_CHECK
-bool BatteryMonitor::isOpFastCharge() {
-    String8 path;
-    path.appendFormat("%s/battery/fastchg_status", POWER_SUPPLY_SYSFS_PATH);
-    int fastChgValue = (access(path.string(), R_OK) == 0) ? getIntField(path) : 0;
-    return fastChgValue != 0;
-}
-
-int BatteryMonitor::getOpFastCurrent(int ChargingCurrent) {
-    KLOG_WARNING(LOG_TAG, "getOpFastCurrent active = %d ac = %d usb = %d\n", isOpFastCharge(), props.chargerAcOnline, props.chargerUsbOnline);
-    if (props.chargerAcOnline) {
-        if (isOpFastCharge()) {
-            return 1800000;
-        } else {
-            return 1500000;
-        }
-    } else {
-        if (props.chargerUsbOnline) {
-            return 500000;
-        }
-    }
-    return ChargingCurrent;
-}
-#endif
 
 }; // namespace android
